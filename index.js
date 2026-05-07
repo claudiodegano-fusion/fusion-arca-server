@@ -400,4 +400,54 @@ app.post('/arcaFacturar', async (req, res) => {
   }
 });
 
+// ── GET /padron/:cuit  —  consultar padrón público ARCA ───────────────────
+app.get('/padron/:cuit', async (req, res) => {
+  try {
+    const cuit = req.params.cuit.replace(/\D/g, '');
+    if (cuit.length !== 11) throw new Error('CUIT inválido (debe tener 11 dígitos)');
+    const resp = await axios.get(`https://soa.afip.gob.ar/sr-padron/v2/persona/${cuit}`, {
+      headers: { 'Accept': 'application/json' },
+      timeout: 10000,
+    });
+    const d = resp.data?.data;
+    if (!d) throw new Error('CUIT no encontrado en el padrón ARCA');
+
+    // Determinar condición IVA
+    const impuestos = d.impuestos || [];
+    const tieneIVA  = impuestos.some(i => i.idImpuesto === 30);  // IVA RI
+    const tieneMono = impuestos.some(i => i.idImpuesto === 20);  // Monotributo
+    let condIva = 'Consumidor Final';
+    if (tieneIVA)  condIva = 'Responsable Inscripto';
+    else if (tieneMono) condIva = 'Monotributista';
+
+    // Tipo de comprobante sugerido
+    let tipoCbte = 'B';
+    if (condIva === 'Responsable Inscripto') tipoCbte = 'A';
+    else if (condIva === 'Monotributista')   tipoCbte = 'C';
+
+    // Razón social o nombre completo
+    const razonSocial = d.razonSocial || [d.apellido, d.nombre].filter(Boolean).join(', ');
+
+    // Domicilio
+    const dom = d.domicilioFiscal;
+    const domicilio = dom
+      ? [dom.direccion, dom.localidad, dom.descripcionProvincia].filter(Boolean).join(', ')
+      : '';
+
+    res.json({
+      ok: true,
+      cuit,
+      razonSocial,
+      condIva,
+      tipoCbte,
+      domicilio,
+      estadoClave: d.estadoClave,
+      raw: { impuestos: impuestos.map(i => i.idImpuesto) },
+    });
+  } catch (err) {
+    const status = err.response?.status === 404 ? 404 : 500;
+    res.status(status).json({ ok: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => console.log('✅ Fusion CRM ARCA Server en puerto', PORT));
