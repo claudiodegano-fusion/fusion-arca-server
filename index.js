@@ -405,30 +405,60 @@ app.get('/padron/:cuit', async (req, res) => {
   try {
     const cuit = req.params.cuit.replace(/\D/g, '');
     if (cuit.length !== 11) throw new Error('CUIT inválido (debe tener 11 dígitos)');
-    const resp = await axios.get(`https://soa.afip.gob.ar/sr-padron/v2/persona/${cuit}`, {
-      headers: { 'Accept': 'application/json' },
-      timeout: 10000,
-    });
-    const d = resp.data?.data;
-    if (!d) throw new Error('CUIT no encontrado en el padrón ARCA');
 
-    // Determinar condición IVA
+    let d = null;
+
+    // Intentar API oficial AFIP
+    try {
+      const resp = await axios.get(`https://soa.afip.gob.ar/sr-padron/v2/persona/${cuit}`, {
+        headers: { 'Accept': 'application/json' },
+        timeout: 10000,
+      });
+      d = resp.data?.data || null;
+    } catch(e1) {}
+
+    // Fallback: tangofactura (más permisiva)
+    if (!d) {
+      try {
+        const resp2 = await axios.get(`https://afip.tangofactura.com/Rest/GetContribuyenteFull?cuit=${cuit}`, {
+          headers: { 'Accept': 'application/json' },
+          timeout: 10000,
+        });
+        const contrib = resp2.data?.Contribuyente || resp2.data?.contribuyente || resp2.data;
+        if (contrib && !contrib.errorConstancia) {
+          d = {
+            razonSocial: contrib.razonSocial || contrib.RazonSocial || '',
+            apellido:    contrib.apellido    || contrib.Apellido    || '',
+            nombre:      contrib.nombre      || contrib.Nombre      || '',
+            estadoClave: contrib.estadoClave || contrib.EstadoClave || 'ACTIVO',
+            tipoPersona: contrib.tipoPersona || contrib.TipoPersona || '',
+            impuestos:   (contrib.impuestosActivos || []).map(i =>
+              typeof i === 'object' ? { idImpuesto: Number(i.idImpuesto ?? i.id ?? i) } : { idImpuesto: Number(i) }
+            ),
+          };
+        }
+      } catch(e2) {}
+    }
+
+    if (!d) throw new Error('CUIT no encontrado en el padrón de ARCA');
+
+    // Razón social — empresa: razonSocial; persona física: Apellido, Nombre
+    const razonSocial = d.razonSocial ||
+      [d.apellido, d.nombre].filter(Boolean).join(', ') || '';
+
+    // Condición IVA
     const impuestos = d.impuestos || [];
-    const tieneIVA  = impuestos.some(i => i.idImpuesto === 30);  // IVA RI
-    const tieneMono = impuestos.some(i => i.idImpuesto === 20);  // Monotributo
+    const tieneIVA  = impuestos.some(i => i.idImpuesto === 30);
+    const tieneMono = impuestos.some(i => i.idImpuesto === 20);
     let condIva = 'Consumidor Final';
     if (tieneIVA)  condIva = 'Responsable Inscripto';
     else if (tieneMono) condIva = 'Monotributista';
+    else if ((d.tipoPersona || '').toUpperCase() === 'JURIDICA') condIva = 'Responsable Inscripto';
 
-    // Tipo de comprobante sugerido
     let tipoCbte = 'B';
     if (condIva === 'Responsable Inscripto') tipoCbte = 'A';
     else if (condIva === 'Monotributista')   tipoCbte = 'C';
 
-    // Razón social o nombre completo
-    const razonSocial = d.razonSocial || [d.apellido, d.nombre].filter(Boolean).join(', ');
-
-    // Domicilio
     const dom = d.domicilioFiscal;
     const domicilio = dom
       ? [dom.direccion, dom.localidad, dom.descripcionProvincia].filter(Boolean).join(', ')
@@ -441,8 +471,7 @@ app.get('/padron/:cuit', async (req, res) => {
       condIva,
       tipoCbte,
       domicilio,
-      estadoClave: d.estadoClave,
-      raw: { impuestos: impuestos.map(i => i.idImpuesto) },
+      estadoClave: d.estadoClave || 'ACTIVO',
     });
   } catch (err) {
     const status = err.response?.status === 404 ? 404 : 500;
