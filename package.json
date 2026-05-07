@@ -1,0 +1,135 @@
+// Fusion CRM — Servidor ARCA para Render.com
+// Proxy entre el CRM y el Web Service de Facturación Electrónica (WSFEv1) de ARCA
+
+'use strict';
+
+const express = require('express');
+const cors    = require('cors');
+const { loginWSAA }                    = require('./arca/wsaa');
+const { ultimoNumero, solicitarCAELote, TIPOS_CBTE } = require('./arca/wsfev1');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+// ── Middleware ─────────────────────────────────────────────────────────────
+app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'] }));
+app.use(express.json({ limit: '2mb' }));
+
+// ── Cache de Token de Acceso (válido 12 hs) ────────────────────────────────
+let taCache = null;
+
+async function obtenerTA(certPem, keyPem) {
+  const ahora = new Date();
+  if (taCache && taCache.expiracion > ahora) return taCache;
+  const ta  = await loginWSAA(certPem, keyPem);
+  const exp = new Date(ta.expiracion);
+  taCache   = { token: ta.token, sign: ta.sign, expiracion: exp };
+  return taCache;
+}
+
+// ── GET /  —  health check ─────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    servicio: 'Fusion CRM — Proxy ARCA WSFEv1',
+    version: '1.0.0',
+    ts: new Date().toISOString(),
+  });
+});
+
+// ── POST /arcaLogin  —  verificar certificado y obtener TA ─────────────────
+app.post('/arcaLogin', async (req, res) => {
+  try {
+    const { certPem, keyPem } = req.body;
+    if (!certPem || !keyPem) throw new Error('Faltan certPem o keyPem');
+    taCache = null; // forzar refresh
+    const ta = await obtenerTA(certPem, keyPem);
+    res.json({ ok: true, expiracion: ta.expiracion });
+  } catch (err) {
+    console.error('[arcaLogin]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── POST /arcaUltimoNumero  —  último comprobante autorizado ───────────────
+app.post('/arcaUltimoNumero', async (req, res) => {
+  try {
+    const { certPem, keyPem, cuit, ptoVta, tipoCbte } = req.body;
+    const ta  = await obtenerTA(certPem, keyPem);
+    const nro = await ultimoNumero({ ...ta, cuit }, ptoVta, tipoCbte);
+    res.json({ ok: true, nro });
+  } catch (err) {
+    console.error('[arcaUltimoNumero]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── POST /arcaFacturar  —  emitir lote de comprobantes ────────────────────
+// Body: { certPem, keyPem, cuit, ptoVta, items: [...] }
+app.post('/arcaFacturar', async (req, res) => {
+  try {
+    const { certPem, keyPem, cuit, ptoVta, items } = req.body;
+    if (!certPem || !keyPem || !cuit || !ptoVta || !items?.length) {
+      throw new Error('Faltan parámetros: certPem, keyPem, cuit, ptoVta, items');
+    }
+
+    const ta   = await obtenerTA(certPem, keyPem);
+    const auth = { ...ta, cuit };
+
+    // Agrupar por tipo de comprobante
+    const grupos = {};
+    items.forEach((item, idx) => {
+      const t = item.tipoCbte || 'B';
+      if (!grupos[t]) grupos[t] = [];
+      grupos[t].push({ ...item, _origIdx: idx });
+    });
+
+    const resultadosGlobales = new Array(items.length).fill(null);
+
+    for (const [tipoCbte, grupoItems] of Object.entries(grupos)) {
+      const tipoCbteNum = TIPOS_CBTE[tipoCbte];
+      if (!tipoCbteNum) {
+        grupoItems.forEach(item => {
+          resultadosGlobales[item._origIdx] = {
+            error: `Tipo ${tipoCbte} no reconocido`,
+            empresa: item.empresa,
+          };
+        });
+        continue;
+      }
+
+      const ultimoNro  = await ultimoNumero(auth, ptoVta, tipoCbteNum);
+      const nroInicial = ultimoNro + 1;
+      const resultado  = await solicitarCAELote(auth, ptoVta, tipoCbte, grupoItems, nroInicial);
+
+      resultado.resultados.forEach((r, i) => {
+        const origIdx = grupoItems[i]._origIdx;
+        const item    = grupoItems[i];
+        resultadosGlobales[origIdx] = {
+          empresa:        item.empresa,
+          idCliente:      item.idCliente,
+          tipoCbte,
+          ptoVta:         parseInt(ptoVta),
+          nroComprobante: r.nroComprobante,
+          cae:            r.cae,
+          vencimientoCAE: r.vencimientoCAE,
+          resultado:      r.resultado,
+          observaciones:  r.observaciones,
+          errores:        r.errores,
+          importeTotal:   item.importeTotal,
+          fecha:          new Date().toISOString(),
+        };
+      });
+    }
+
+    res.json({ ok: true, resultados: resultadosGlobales });
+  } catch (err) {
+    console.error('[arcaFacturar]', err.message, err.stack);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── Iniciar servidor ───────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`✅ Fusion CRM ARCA Server corriendo en puerto ${PORT}`);
+});
