@@ -442,18 +442,29 @@ app.get('/padron/:cuit', async (req, res) => {
 
     if (!d) throw new Error('CUIT no encontrado en el padrón de ARCA');
 
-    // Razón social — empresa: razonSocial; persona física: Apellido, Nombre
-    const razonSocial = d.razonSocial ||
-      [d.apellido, d.nombre].filter(Boolean).join(', ') || '';
+    // La API de AFIP usa 'nombre' para empresas y 'apellido'+'nombre' para personas físicas
+    const tipoPersona = (d.tipoPersona || '').toUpperCase();
+    let razonSocial = '';
+    if (tipoPersona === 'JURIDICA') {
+      razonSocial = d.nombre || d.razonSocial || '';
+    } else {
+      // Persona física: "APELLIDO, Nombre"
+      razonSocial = [d.apellido, d.nombre].filter(Boolean).join(', ') || d.razonSocial || '';
+    }
 
-    // Condición IVA
+    // Códigos AFIP: 20=IVA RI, 21=Monotributo integrado, 30=también IVA en algunos casos
+    // datosMonotributo presente = es monotributista
     const impuestos = d.impuestos || [];
-    const tieneIVA  = impuestos.some(i => i.idImpuesto === 30);
-    const tieneMono = impuestos.some(i => i.idImpuesto === 20);
+    const impIds = impuestos.map(i => Number(i.idImpuesto));
+    const esMono = !!(d.datosMonotributo) || impIds.includes(21) || impIds.includes(20) && d.tipoPersona === 'FISICA' && !impIds.includes(30);
+    const esRI   = impIds.includes(20) && !esMono || impIds.includes(30) || tipoPersona === 'JURIDICA' && impIds.includes(20);
+
     let condIva = 'Consumidor Final';
-    if (tieneIVA)  condIva = 'Responsable Inscripto';
-    else if (tieneMono) condIva = 'Monotributista';
-    else if ((d.tipoPersona || '').toUpperCase() === 'JURIDICA') condIva = 'Responsable Inscripto';
+    if (esRI && !esMono)          condIva = 'Responsable Inscripto';
+    else if (esMono)              condIva = 'Monotributista';
+    else if (d.datosMonotributo)  condIva = 'Monotributista';
+    // Fallback por tipo de persona
+    if (condIva === 'Consumidor Final' && tipoPersona === 'JURIDICA') condIva = 'Responsable Inscripto';
 
     let tipoCbte = 'B';
     if (condIva === 'Responsable Inscripto') tipoCbte = 'A';
