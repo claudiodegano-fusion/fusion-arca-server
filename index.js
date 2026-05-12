@@ -471,9 +471,10 @@ app.get('/padron/:cuit', async (req, res) => {
     else if (condIva === 'Monotributista')   tipoCbte = 'C';
 
     const dom = d.domicilioFiscal;
-    const domicilio = dom
-      ? [dom.direccion, dom.localidad, dom.descripcionProvincia].filter(Boolean).join(', ')
-      : '';
+    const domDireccion   = dom?.direccion             || '';
+    const domLocalidad   = dom?.localidad             || '';
+    const domProvincia   = dom?.descripcionProvincia  || '';
+    const domicilio = [domDireccion, domLocalidad, domProvincia].filter(Boolean).join(', ');
 
     res.json({
       ok: true,
@@ -482,6 +483,9 @@ app.get('/padron/:cuit', async (req, res) => {
       condIva,
       tipoCbte,
       domicilio,
+      direccion:  domDireccion,
+      localidad:  domLocalidad,
+      provincia:  domProvincia,
       estadoClave: d.estadoClave || 'ACTIVO',
     });
   } catch (err) {
