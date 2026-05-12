@@ -400,23 +400,200 @@ app.post('/arcaFacturar', async (req, res) => {
   }
 });
 
-// ── GET /padron/:cuit  —  consultar padrón público ARCA ───────────────────
-app.get('/padron/:cuit', async (req, res) => {
+// ── POST /padron/:cuit  —  consulta autenticada padrón AFIP (personaServiceA5) ──
+const PADRON_URL = 'https://aws.afip.gov.ar/sr-padron/webservices/personaServiceA5';
+
+async function loginWSAAPadron(certPem, keyPem) {
+  const tra = generarTRA('ws_sr_padron_afip');
+  const cms = firmarTRA(tra, certPem, keyPem);
+  const soap = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:wsaa="http://wsaa.view.sua.dvadac.desein.afip.gov">
+  <soapenv:Header/><soapenv:Body>
+    <wsaa:loginCms><wsaa:in0>${cms}</wsaa:in0></wsaa:loginCms>
+  </soapenv:Body></soapenv:Envelope>`;
+  const resp = await axios.post(WSAA_URL, soap, {
+    headers: { 'Content-Type': 'text/xml; charset=utf-8', SOAPAction: '""' },
+    timeout: 30000,
+  });
+  const parsed = await xml2js.parseStringPromise(resp.data, { explicitArray: false });
+  const body = parsed['soapenv:Envelope']?.['soapenv:Body']
+            || parsed['S:Envelope']?.['S:Body']
+            || Object.values(parsed)[0]?.Body
+            || {};
+  const ret = body['loginCmsReturn'] || body['ns1:loginCmsReturn']
+           || Object.values(body)[0]?.return || Object.values(body)[0];
+  const inner = await xml2js.parseStringPromise(typeof ret === 'string' ? ret : ret?._ || '', { explicitArray: false });
+  const creds = inner['loginTicketResponse']['credentials'];
+  return { token: creds.token, sign: creds.sign };
+}
+
+app.post('/padron/:cuit', async (req, res) => {
+  try {
+    const cuit = req.params.cuit.replace(/\D/g, '');
+    if (cuit.length !== 11) throw new Error('CUIT inválido');
+    const { cert, key, cuitRepresentada } = req.body || {};
+
+    // ── Consulta autenticada con WSAA + personaServiceA5 ──────────────────
+    if (cert && key && cuitRepresentada) {
+      const { token, sign } = await loginWSAAPadron(cert, key);
+      const soapBody = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:per="http://a5.soap.personaservice.sr.afip.gov.ar">
+  <soapenv:Header/><soapenv:Body>
+    <per:getPersona>
+      <token>${token}</token>
+      <sign>${sign}</sign>
+      <cuitRepresentada>${cuitRepresentada}</cuitRepresentada>
+      <idPersona>${cuit}</idPersona>
+    </per:getPersona>
+  </soapenv:Body></soapenv:Envelope>`;
+
+      const soapResp = await axios.post(PADRON_URL, soapBody, {
+        headers: {
+          'Content-Type': 'text/xml; charset=utf-8',
+          SOAPAction: '"getPersona"',
+        },
+        timeout: 20000,
+      });
+
+      const parsed = await xml2js.parseStringPromise(soapResp.data, { explicitArray: false });
+      // Navegar el envelope — puede tener prefijos distintos
+      const env = parsed['soapenv:Envelope'] || parsed['S:Envelope'] || Object.values(parsed)[0];
+      const bod = env['soapenv:Body'] || env['S:Body'] || Object.values(env)[0];
+      const per = bod['per:getPersonaResponse']?.['personaReturn']
+               || bod['getPersonaResponse']?.['personaReturn']
+               || Object.values(bod)[0]?.personaReturn
+               || Object.values(bod)[0];
+
+      if (!per) throw new Error('Respuesta SOAP vacía');
+
+      const tipoPersona = (per.tipoPersona || '').toUpperCase();
+      let razonSocial = '';
+      if (tipoPersona === 'JURIDICA') {
+        razonSocial = per.nombre || per.razonSocial || '';
+      } else {
+        razonSocial = [per.apellido, per.nombre].filter(Boolean).join(', ') || per.razonSocial || '';
+      }
+
+      // Domicilio fiscal
+      const df = per.domicilioFiscal || {};
+      const domDireccion = df.direccion || '';
+      const domLocalidad = df.localidad || '';
+      const domProvincia = df.descripcionProvincia || '';
+      const domicilio = [domDireccion, domLocalidad, domProvincia].filter(Boolean).join(', ');
+
+      // Condición IVA
+      const impRaw = per.impuesto
+        ? (Array.isArray(per.impuesto) ? per.impuesto : [per.impuesto])
+        : [];
+      const impIds = impRaw.map(i => Number(i.idImpuesto || i));
+      const esMono = !!(per.datosMonotributo) || impIds.includes(21)
+                  || (impIds.includes(20) && tipoPersona !== 'JURIDICA' && !impIds.includes(30));
+      const esRI = (impIds.includes(20) && !esMono) || impIds.includes(30)
+                || (tipoPersona === 'JURIDICA' && impIds.includes(20));
+      let condIva = 'Consumidor Final';
+      if (esRI && !esMono) condIva = 'Responsable Inscripto';
+      else if (esMono) condIva = 'Monotributista';
+      if (condIva === 'Consumidor Final' && tipoPersona === 'JURIDICA') condIva = 'Responsable Inscripto';
+
+      const tipoCbte = condIva === 'Responsable Inscripto' ? 'A' : condIva === 'Monotributista' ? 'C' : 'B';
+
+      return res.json({
+        ok: true, cuit, razonSocial, condIva, tipoCbte,
+        domicilio, direccion: domDireccion, localidad: domLocalidad, provincia: domProvincia,
+        estadoClave: per.estadoClave || 'ACTIVO',
+      });
+    }
+
+    // ── Fallback sin auth: API pública + tangofactura ─────────────────────
+    let d = null;
+    try {
+      const r = await axios.get(`https://soa.afip.gob.ar/sr-padron/v2/persona/${cuit}`,
+        { headers: { Accept: 'application/json' }, timeout: 8000 });
+      const raw = r.data?.data || null;
+      if (raw && (raw.apellido || raw.nombre || raw.razonSocial)) d = raw;
+    } catch (_) {}
+
+    if (!d) {
+      try {
+        const r2 = await axios.get(`https://afip.tangofactura.com/Rest/GetContribuyenteFull?cuit=${cuit}`,
+          { headers: { Accept: 'application/json' }, timeout: 10000 });
+        const c2 = r2.data?.Contribuyente || r2.data?.contribuyente || r2.data;
+        if (c2 && !c2.errorConstancia) {
+          const df2 = c2.domicilioFiscal || c2.DomicilioFiscal || null;
+          const cats = c2.categoriasMonotributo || c2.CategoriaMonotributo || [];
+          d = {
+            razonSocial: c2.razonSocial || c2.RazonSocial || '',
+            apellido: c2.apellido || c2.Apellido || '',
+            nombre: c2.nombre || c2.Nombre || '',
+            estadoClave: c2.estadoClave || 'ACTIVO',
+            tipoPersona: c2.tipoPersona || c2.TipoPersona || '',
+            impuestos: (c2.impuestosActivos || []).map(i =>
+              typeof i === 'object' ? { idImpuesto: Number(i.idImpuesto ?? i.id ?? i) } : { idImpuesto: Number(i) }),
+            domicilioFiscal: df2 ? {
+              direccion: df2.direccion || df2.Direccion || '',
+              localidad: df2.localidad || df2.Localidad || '',
+              descripcionProvincia: df2.descripcionProvincia || df2.DescripcionProvincia || '',
+            } : null,
+            datosMonotributo: cats.length > 0 ? cats : null,
+          };
+        }
+      } catch (_) {}
+    }
+
+    if (!d) throw new Error('CUIT no encontrado en el padrón de ARCA');
+
+    const tipoPersona = (d.tipoPersona || '').toUpperCase();
+    const razonSocial = tipoPersona === 'JURIDICA'
+      ? (d.nombre || d.razonSocial || '')
+      : ([d.apellido, d.nombre].filter(Boolean).join(', ') || d.razonSocial || '');
+
+    const impIds = (d.impuestos || []).map(i => Number(i.idImpuesto));
+    const esMono = !!(d.datosMonotributo) || impIds.includes(21)
+                || (impIds.includes(20) && tipoPersona !== 'JURIDICA' && !impIds.includes(30));
+    const esRI = (impIds.includes(20) && !esMono) || impIds.includes(30)
+              || (tipoPersona === 'JURIDICA' && impIds.includes(20));
+    let condIva = 'Consumidor Final';
+    if (esRI && !esMono) condIva = 'Responsable Inscripto';
+    else if (esMono) condIva = 'Monotributista';
+    if (condIva === 'Consumidor Final' && tipoPersona === 'JURIDICA') condIva = 'Responsable Inscripto';
+    const tipoCbte = condIva === 'Responsable Inscripto' ? 'A' : condIva === 'Monotributista' ? 'C' : 'B';
+
+    const dom = d.domicilioFiscal;
+    const domDireccion = dom?.direccion || '';
+    const domLocalidad = dom?.localidad || '';
+    const domProvincia = dom?.descripcionProvincia || '';
+    const domicilio = [domDireccion, domLocalidad, domProvincia].filter(Boolean).join(', ');
+
+    res.json({
+      ok: true, cuit, razonSocial, condIva, tipoCbte,
+      domicilio, direccion: domDireccion, localidad: domLocalidad, provincia: domProvincia,
+      estadoClave: d.estadoClave || 'ACTIVO',
+    });
+  } catch (err) {
+    res.status(err.response?.status === 404 ? 404 : 500).json({ ok: false, error: err.message });
+  }
+});
   try {
     const cuit = req.params.cuit.replace(/\D/g, '');
     if (cuit.length !== 11) throw new Error('CUIT inválido (debe tener 11 dígitos)');
 
     let d = null;
 
-    // Intentar API oficial AFIP
+    // Intentar API oficial AFIP (sr-padron v2 — sin auth para consulta básica)
     try {
       const resp = await axios.get(`https://soa.afip.gob.ar/sr-padron/v2/persona/${cuit}`, {
         headers: { 'Accept': 'application/json' },
-        timeout: 10000,
+        timeout: 8000,
       });
-      d = resp.data?.data || null;
-    } catch(e1) {}
-
+      const raw = resp.data?.data || null;
+      if (raw && (raw.apellido || raw.nombre || raw.razonSocial)) {
+        d = raw;
+      }
+    } catch(e1) {
+      // AFIP oficial no disponible o no tiene datos — continuar con fallback
+    }
     // Fallback: tangofactura (más permisiva)
     if (!d) {
       try {
@@ -426,15 +603,25 @@ app.get('/padron/:cuit', async (req, res) => {
         });
         const contrib = resp2.data?.Contribuyente || resp2.data?.contribuyente || resp2.data;
         if (contrib && !contrib.errorConstancia) {
+          // Domicilio fiscal desde tangofactura
+          const df = contrib.domicilioFiscal || contrib.DomicilioFiscal || null;
+          // Categorías monotributo
+          const cats = contrib.categoriasMonotributo || contrib.CategoriaMonotributo || contrib.categorias || [];
           d = {
-            razonSocial: contrib.razonSocial || contrib.RazonSocial || '',
-            apellido:    contrib.apellido    || contrib.Apellido    || '',
-            nombre:      contrib.nombre      || contrib.Nombre      || '',
-            estadoClave: contrib.estadoClave || contrib.EstadoClave || 'ACTIVO',
-            tipoPersona: contrib.tipoPersona || contrib.TipoPersona || '',
-            impuestos:   (contrib.impuestosActivos || []).map(i =>
+            razonSocial:     contrib.razonSocial     || contrib.RazonSocial     || '',
+            apellido:        contrib.apellido         || contrib.Apellido         || '',
+            nombre:          contrib.nombre           || contrib.Nombre           || '',
+            estadoClave:     contrib.estadoClave      || contrib.EstadoClave      || 'ACTIVO',
+            tipoPersona:     contrib.tipoPersona      || contrib.TipoPersona      || '',
+            impuestos:       (contrib.impuestosActivos || contrib.ImpuestosActivos || []).map(i =>
               typeof i === 'object' ? { idImpuesto: Number(i.idImpuesto ?? i.id ?? i) } : { idImpuesto: Number(i) }
             ),
+            domicilioFiscal: df ? {
+              direccion:            df.direccion            || df.Direccion            || '',
+              localidad:            df.localidad            || df.Localidad            || '',
+              descripcionProvincia: df.descripcionProvincia || df.DescripcionProvincia || '',
+            } : null,
+            datosMonotributo: cats.length > 0 ? cats : null,
           };
         }
       } catch(e2) {}
